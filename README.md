@@ -24,7 +24,7 @@ reload cost (assuming `OLLAMA_MAX_LOADED_MODELS` is high enough).
 ## Install
 
 ```
-cd /home/marc/dnd
+cd ollama-multi-chat
 uv venv .venv
 uv pip install --python .venv -r requirements.txt
 ```
