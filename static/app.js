@@ -145,11 +145,13 @@ async function ensureAvatar() {
   audioQueue = new AudioQueue(avatar);
   ptt = new PushToTalk({
     button: $("mic-btn"),
+    onPressStart: () => { if (avatar) avatar.stopSpeaking(); },
     onTranscript: (text) => {
       if (!active) return;
       active.ws.send(JSON.stringify({ type: "user_message", content: text }));
     },
   });
+  $("stop-btn").onclick = () => { if (avatar) avatar.stopSpeaking(); };
   // Load the avatar mesh in the background so failures don't break voice.
   avatar.load().catch((e) => {
     console.error("avatar load failed:", e);
@@ -186,7 +188,7 @@ function handleEvent(ev) {
       break;
     }
     case "tts_chunk": {
-      if (audioQueue) audioQueue.enqueueWavBase64(ev.audio_b64);
+      if (audioQueue) audioQueue.enqueueWavBase64(ev.audio_b64, ev.text || "");
       break;
     }
     case "thinking": {

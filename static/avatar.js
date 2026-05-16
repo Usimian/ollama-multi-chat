@@ -1,177 +1,124 @@
-// Avatar renderer + audio queue + push-to-talk recorder.
-// Drives a ReadyPlayerMe avatar's mouth/jaw blendshapes from the playing-audio RMS.
+// Avatar renderer + audio queue + push-to-talk.
+// Wraps met4citizen/TalkingHead so the chat app gets idle motion, blinks,
+// micro-saccades, head sway, and proper viseme-driven lipsync.
 
-import * as THREE from "/static/vendor/three.module.min.js";
-import { GLTFLoader } from "/static/vendor/GLTFLoader.js";
+import { TalkingHead } from "/static/vendor/talkinghead/talkinghead.mjs";
 
 const DEFAULT_AVATAR_URL = "/static/avatar.glb";
 
-const MOUTH_MORPHS = [
-  "jawOpen", "mouthOpen", "viseme_aa", "viseme_O", "viseme_E",
-];
-
 export class Avatar {
-  constructor(canvasEl) {
-    this.canvas = canvasEl;
-    this.renderer = new THREE.WebGLRenderer({ canvas: canvasEl, antialias: true, alpha: true });
-    this.renderer.setPixelRatio(window.devicePixelRatio);
-    this.scene = new THREE.Scene();
-    this.scene.background = null;
-    this.camera = new THREE.PerspectiveCamera(28, 1, 0.1, 100);
-    this.camera.position.set(0, 1.55, 1.3);
-    this.camera.lookAt(0, 1.55, 0);
-
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x404060, 0.8);
-    this.scene.add(hemi);
-    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
-    dir.position.set(1, 2, 2);
-    this.scene.add(dir);
-
-    this.mouthTargets = []; // { mesh, indices: number[] }
-    this.blinkTargets = [];
-    this.currentMouth = 0;  // 0..1, smoothed
-    this.targetMouth = 0;
-    this.blinkTimer = 0;
-    this.blinkPhase = 0;
-
-    this._resize();
-    window.addEventListener("resize", () => this._resize());
-    this._animate();
-  }
-
-  _resize() {
-    const w = this.canvas.clientWidth || 400;
-    const h = this.canvas.clientHeight || 500;
-    this.renderer.setSize(w, h, false);
-    this.camera.aspect = w / h;
-    this.camera.updateProjectionMatrix();
+  constructor(containerEl) {
+    // TalkingHead needs a container DIV (it creates its own canvas inside).
+    // If the caller passed a <canvas>, swap it out.
+    let el = containerEl;
+    if (el.tagName === "CANVAS") {
+      const div = document.createElement("div");
+      div.id = el.id;
+      div.className = el.className;
+      div.style.cssText = el.style.cssText;
+      el.parentNode.replaceChild(div, el);
+      el = div;
+    }
+    this.container = el;
+    this.head = new TalkingHead(el, {
+      ttsEndpoint: "",            // we feed pre-rendered audio
+      lipsyncModules: ["en"],
+      cameraView: "upper",
+    });
+    this._loaded = false;
   }
 
   async load(url = DEFAULT_AVATAR_URL) {
-    if (this.avatar) this.scene.remove(this.avatar);
-    const loader = new GLTFLoader();
-    const gltf = await loader.loadAsync(url);
-    this.avatar = gltf.scene;
-    this.scene.add(this.avatar);
-
-    this.mouthTargets = [];
-    this.blinkTargets = [];
-    this.avatar.traverse((node) => {
-      if (!node.isMesh || !node.morphTargetDictionary) return;
-      const dict = node.morphTargetDictionary;
-      const mouthIdx = MOUTH_MORPHS.map((n) => dict[n]).filter((i) => i !== undefined);
-      if (mouthIdx.length) this.mouthTargets.push({ mesh: node, indices: mouthIdx });
-      const blinkL = dict["eyeBlinkLeft"] ?? dict["eyesClosed"];
-      const blinkR = dict["eyeBlinkRight"] ?? dict["eyesClosed"];
-      const blinkIdx = [blinkL, blinkR].filter((i) => i !== undefined);
-      if (blinkIdx.length) this.blinkTargets.push({ mesh: node, indices: blinkIdx });
+    await this.head.showAvatar({
+      url,
+      body: "F",
+      avatarMood: "neutral",
+      lipsyncLang: "en",
     });
+    this._loaded = true;
+    this.head.start();
   }
 
-  setMouth(level) {
-    // level in [0,1]
-    this.targetMouth = Math.max(0, Math.min(1, level));
+  // Build approximate word/duration timings for a sentence given the audio length.
+  // TalkingHead's lipsync module converts these to viseme animations.
+  _buildSpeechItem(text, audioBuffer) {
+    const cleaned = (text || "").replace(/\s+/g, " ").trim();
+    const words = cleaned ? cleaned.split(" ") : [];
+    const totalMs = audioBuffer.duration * 1000;
+    const item = { audio: audioBuffer };
+    if (words.length) {
+      const totalChars = words.reduce((n, w) => n + Math.max(1, w.length), 0);
+      const msPerChar = totalMs / totalChars;
+      const wtimes = [];
+      const wdurations = [];
+      let t = 0;
+      for (const w of words) {
+        const d = Math.max(80, w.length * msPerChar);
+        wtimes.push(t);
+        wdurations.push(d);
+        t += d;
+      }
+      item.words = words;
+      item.wtimes = wtimes;
+      item.wdurations = wdurations;
+    }
+    return item;
   }
 
-  _animate() {
-    const tick = () => {
-      // smooth mouth
-      this.currentMouth += (this.targetMouth - this.currentMouth) * 0.35;
-      for (const { mesh, indices } of this.mouthTargets) {
-        for (const i of indices) mesh.morphTargetInfluences[i] = this.currentMouth;
-      }
+  // Called by AudioQueue to play a Kokoro WAV chunk with lipsync.
+  async speak(text, wavBytes) {
+    if (!this._loaded) {
+      // If avatar mesh isn't loaded yet, fall back to plain playback.
+      await this._playRaw(wavBytes);
+      return;
+    }
+    const buf = await this.head.audioCtx.decodeAudioData(wavBytes.buffer.slice(0));
+    const item = this._buildSpeechItem(text, buf);
+    this.head.speakAudio(item);
+  }
 
-      // simple blink ~ every 4s
-      this.blinkTimer += 1 / 60;
-      let blink = 0;
-      if (this.blinkTimer > 4) {
-        this.blinkPhase += 1 / 60;
-        const t = this.blinkPhase / 0.18;
-        blink = t < 1 ? Math.sin(t * Math.PI) : 0;
-        if (this.blinkPhase > 0.18) {
-          this.blinkPhase = 0;
-          this.blinkTimer = 0;
-        }
-      }
-      for (const { mesh, indices } of this.blinkTargets) {
-        for (const i of indices) mesh.morphTargetInfluences[i] = blink;
-      }
+  stopSpeaking() {
+    try { this.head.stopSpeaking(); } catch (e) { console.warn("stopSpeaking:", e); }
+  }
 
-      this.renderer.render(this.scene, this.camera);
-      requestAnimationFrame(tick);
-    };
-    tick();
+  async _playRaw(wavBytes) {
+    const ctx = this.head.audioCtx;
+    const buf = await ctx.decodeAudioData(wavBytes.buffer.slice(0));
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.connect(ctx.destination);
+    src.start();
   }
 }
 
 
-// ---------- Audio queue + RMS-driven mouth ----------
+// ---------- Audio queue: feeds Kokoro chunks into the TalkingHead speech queue ----------
 
 export class AudioQueue {
   constructor(avatar) {
     this.avatar = avatar;
-    this.ctx = null;
-    this.analyser = null;
-    this.nextTime = 0;
-    this.queue = Promise.resolve();
-    this._rmsLoop();
   }
 
-  _ensureCtx() {
-    if (this.ctx) return;
-    this.ctx = new (window.AudioContext || window.webkitAudioContext)();
-    this.analyser = this.ctx.createAnalyser();
-    this.analyser.fftSize = 1024;
-    this.analyser.connect(this.ctx.destination);
-    this.rmsBuf = new Float32Array(this.analyser.fftSize);
-  }
-
-  _rmsLoop() {
-    const tick = () => {
-      if (this.analyser) {
-        this.analyser.getFloatTimeDomainData(this.rmsBuf);
-        let sum = 0;
-        for (let i = 0; i < this.rmsBuf.length; i++) sum += this.rmsBuf[i] * this.rmsBuf[i];
-        const rms = Math.sqrt(sum / this.rmsBuf.length);
-        // map ~0.005..0.25 RMS → 0..1 mouth
-        const level = Math.max(0, Math.min(1, (rms - 0.005) * 6));
-        this.avatar.setMouth(level);
-      } else {
-        this.avatar.setMouth(0);
-      }
-      requestAnimationFrame(tick);
-    };
-    tick();
-  }
-
-  enqueueWavBase64(b64) {
-    this.queue = this.queue.then(() => this._playOne(b64));
-  }
-
-  async _playOne(b64) {
-    this._ensureCtx();
+  enqueueWavBase64(b64, text = "") {
     const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-    const buffer = await this.ctx.decodeAudioData(bytes.buffer);
-    const start = Math.max(this.ctx.currentTime, this.nextTime);
-    const src = this.ctx.createBufferSource();
-    src.buffer = buffer;
-    src.connect(this.analyser);
-    src.start(start);
-    this.nextTime = start + buffer.duration;
-    await new Promise((res) => { src.onended = res; });
+    // TalkingHead has its own internal speech queue; just hand it off.
+    this.avatar.speak(text, bytes).catch((e) => console.error("speak failed:", e));
   }
 
   reset() {
-    if (this.ctx) this.nextTime = this.ctx.currentTime;
+    if (this.avatar && this.avatar.head) {
+      try { this.avatar.head.stopSpeaking(); } catch {}
+    }
   }
 }
 
 
-// ---------- Push-to-talk recorder ----------
+// ---------- Push-to-talk recorder (unchanged behavior) ----------
 
 export class PushToTalk {
-  constructor({ onTranscript, button, sttUrl = "/api/stt" }) {
+  constructor({ onTranscript, onPressStart, button, sttUrl = "/api/stt" }) {
     this.onTranscript = onTranscript;
+    this.onPressStart = onPressStart;
     this.button = button;
     this.sttUrl = sttUrl;
     this.recorder = null;
@@ -213,6 +160,7 @@ export class PushToTalk {
 
   async start() {
     if (this.recording) return;
+    if (this.onPressStart) { try { this.onPressStart(); } catch (e) { console.warn(e); } }
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       const mime = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")

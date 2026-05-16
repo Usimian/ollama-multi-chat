@@ -7,7 +7,8 @@
 <script type="importmap">
 {
   "imports": {
-    "three": "/static/vendor/three.module.min.js"
+    "three": "/static/vendor/three/three.module.js",
+    "three/addons/": "/static/vendor/three/addons/"
   }
 }
 </script>
@@ -33,9 +34,10 @@
       <div id="chat-controls"></div>
     </header>
     <div id="avatar-pane" hidden>
-      <canvas id="avatar-canvas"></canvas>
+      <div id="avatar-canvas"></div>
       <div id="avatar-controls">
         <button id="mic-btn" type="button" title="hold to talk (or hold Space)">🎤 hold to talk</button>
+        <button id="stop-btn" type="button" title="stop the avatar speaking">⏹ stop</button>
         <div id="mic-status"></div>
       </div>
     </div>
